@@ -1,0 +1,1 @@
+wget https://dl.fbaipublicfiles.com/pythia/features/open_images.tar.gz
