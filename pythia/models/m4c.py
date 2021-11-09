@@ -16,6 +16,65 @@ from pythia.modules.layers import ClassifierLayer
 
 from pythia.modules.encoders import ImageEncoder
 
+def BoxRelationalEmbedding(f_g, dim_g=64, wave_len=1000, trignometric_embedding= True):
+        """
+        Given a tensor with bbox coordinates for detected objects on each batch image,
+        this function computes a matrix for each image
+        with entry (i,j) given by a vector representation of the
+        displacement between the coordinates of bbox_i, and bbox_j
+        input: np.array of shape=(batch_size, max_nr_bounding_boxes, 4)
+        output: np.array of shape=(batch_size, max_nr_bounding_boxes, max_nr_bounding_boxes, 64)
+        """
+        #returns a relational embedding for each pair of bboxes, with dimension = dim_g
+        #follow implementation of https://github.com/heefe92/Relation_Networks-pytorch/blob/master/model.py#L1014-L1055
+
+        # import pdb; pdb.set_trace()
+        batch_size = f_g.size(0)
+
+        x_min, y_min, x_max, y_max = torch.chunk(f_g, 4, dim=-1)
+
+        cx = (x_min + x_max) * 0.5
+        cy = (y_min + y_max) * 0.5
+        w = (x_max - x_min) + 1.
+        h = (y_max - y_min) + 1.
+
+        #cx.view(1,-1) transposes the vector cx, and so dim(delta_x) = (dim(cx), dim(cx))
+        delta_x = cx - cx.view(batch_size, 1, -1)
+        delta_x = torch.clamp(torch.abs(delta_x / w), min=1e-3)
+        delta_x = torch.log(delta_x)
+
+        delta_y = cy - cy.view(batch_size, 1, -1)
+        delta_y = torch.clamp(torch.abs(delta_y / h), min=1e-3)
+        delta_y = torch.log(delta_y)
+
+        delta_w = torch.log(w / w.view(batch_size, 1, -1))
+        delta_h = torch.log(h / h.view(batch_size, 1, -1))
+
+        matrix_size = delta_h.size()
+        delta_x = delta_x.view(batch_size, matrix_size[1], matrix_size[2], 1)
+        delta_y = delta_y.view(batch_size, matrix_size[1], matrix_size[2], 1)
+        delta_w = delta_w.view(batch_size, matrix_size[1], matrix_size[2], 1)
+        delta_h = delta_h.view(batch_size, matrix_size[1], matrix_size[2], 1)
+
+        position_mat = torch.cat((delta_x, delta_y, delta_w, delta_h), -1)
+
+        if trignometric_embedding == True:
+            feat_range = torch.arange(dim_g / 8).cuda()
+            dim_mat = feat_range / (dim_g / 8)
+            dim_mat = 1. / (torch.pow(wave_len, dim_mat))
+
+            dim_mat = dim_mat.view(1, 1, 1, -1)
+            position_mat = position_mat.view(batch_size, matrix_size[1], matrix_size[2], 4, -1)
+            position_mat = 100. * position_mat
+
+            mul_mat = position_mat * dim_mat
+            mul_mat = mul_mat.view(batch_size, matrix_size[1], matrix_size[2], -1)
+            sin_mat = torch.sin(mul_mat)
+            cos_mat = torch.cos(mul_mat)
+            embedding = torch.cat((sin_mat, cos_mat), -1)
+        else:
+            embedding = position_mat
+        return(embedding)
 
 @registry.register_model("m4c")
 class M4C(BaseModel):
@@ -91,8 +150,25 @@ class M4C(BaseModel):
             4, self.mmt_config.hidden_size
         )
 
+        # relative score 8/11/2021
+        self.linear_obj_rg_to_mmt_in = nn.Linear(
+            100, self.mmt_config.hidden_size
+        )
+
+        # linear grid 9/11/2021
+        self.linear_grid_feat_to_mmt_in = nn.Linear(
+            self.config.obj.mmt_in_dim, self.mmt_config.hidden_size
+        )
+
         self.obj_feat_layer_norm = BertLayerNorm(self.mmt_config.hidden_size)
         self.obj_bbox_layer_norm = BertLayerNorm(self.mmt_config.hidden_size)
+
+        # DoanhBC 9/11/2021 grid layer norm
+        self.obj_grid_layer_norm = BertLayerNorm(self.mmt_config.hidden_size)
+        
+        #Relative layer norm
+        self.obj_relative_layer_norm = BertLayerNorm(self.mmt_config.hidden_size)
+
         self.obj_drop = nn.Dropout(self.config.obj.dropout_prob)
 
     def _build_ocr_encoding(self):
@@ -136,6 +212,8 @@ class M4C(BaseModel):
 
         self.ocr_feat_layer_norm = BertLayerNorm(self.mmt_config.hidden_size)
         self.ocr_bbox_layer_norm = BertLayerNorm(self.mmt_config.hidden_size)
+        self.obj_relative_layer_norm = BertLayerNorm(self.mmt_config.hidden_size)
+        self.WGs = nn.Linear(64, 1, bias=True)
         self.ocr_drop = nn.Dropout(self.config.ocr.dropout_prob)
 
     def _build_mmt(self):
@@ -193,16 +271,28 @@ class M4C(BaseModel):
         obj_fc6 = sample_list.image_feature_0
         obj_fc7 = self.obj_faster_rcnn_fc7(obj_fc6)
         obj_fc7 = F.normalize(obj_fc7, dim=-1)
-
+        
         obj_feat = obj_fc7
+        obj_grid = sample_list.grid_features
         obj_bbox = sample_list.obj_bbox_coordinates
+
+        relative_geometry_embeddings = BoxRelationalEmbedding(obj_bbox)
+        flatten_relative_geometry_embeddings = relative_geometry_embeddings.view(-1, 64)
+        box_size_per_head = list(relative_geometry_embeddings.shape[:3])
+        box_size_per_head.insert(1, 1)
+        relative_geometry_weights = self.WGs(flatten_relative_geometry_embeddings).view(box_size_per_head)
+        objs_relative_geometry = relative_geometry_weights[0][0]
+
+        # import pdb; pdb.set_trace()
+
+        # DoanhBC 9/11 add grid features
         obj_mmt_in = (
-            self.obj_feat_layer_norm(
-                self.linear_obj_feat_to_mmt_in(obj_feat)
-            ) + self.obj_bbox_layer_norm(
-                self.linear_obj_bbox_to_mmt_in(obj_bbox)
-            )
+            self.obj_feat_layer_norm(self.linear_obj_feat_to_mmt_in(obj_feat)) + # box feature
+            self.obj_bbox_layer_norm(self.linear_obj_bbox_to_mmt_in(obj_bbox)) + # bounding box 
+            self.obj_relative_layer_norm(self.linear_obj_rg_to_mmt_in(objs_relative_geometry)) + # relative
+            self.obj_grid_layer_norm(self.linear_grid_feat_to_mmt_in(obj_grid)) # grid features
         )
+
         obj_mmt_in = self.obj_drop(obj_mmt_in)
         fwd_results['obj_mmt_in'] = obj_mmt_in
 

@@ -6,6 +6,7 @@ from pythia.datasets.vqa.textvqa.dataset import TextVQADataset
 from pythia.utils.text_utils import word_tokenize
 from pythia.common.sample import Sample
 from pythia.utils.objects_to_byte_tensor import enc_obj2bytes
+import os
 
 
 class M4CTextVQADataset(TextVQADataset):
@@ -14,6 +15,7 @@ class M4CTextVQADataset(TextVQADataset):
             dataset_type, imdb_file_index, config, *args, **kwargs
         )
         self._name = "m4c_textvqa"
+        self.grid_features_path = './grid_features_152++/'
 
     def preprocess_sample_info(self, sample_info):
         return sample_info  # Do nothing
@@ -114,6 +116,15 @@ class M4CTextVQADataset(TextVQADataset):
         sample.obj_bbox_coordinates = self.copy_processor(
             {"blob": sample_info["obj_normalized_boxes"]}
         )["blob"]
+
+        # DoanhBC 9/11/2021 load feature
+        dir_grid_feature = os.path.join(self.grid_features_path, sample_info["image_id"]) + '.npy'
+        grid_feature = np.load(dir_grid_feature, allow_pickle=True)
+        grid_feature = torch.from_numpy(grid_feature)
+
+        sample.grid_features = grid_feature
+
+        # print(grid_feature.shape)
 
         # 3. Load OCR
         if not self.use_ocr:
