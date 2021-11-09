@@ -494,8 +494,52 @@ class M4CDecodingBCEWithMaskLoss(nn.Module):
         losses = F.binary_cross_entropy_with_logits(
             scores, targets, reduction="none"
         )
+
+        # import pdb; pdb.set_trace()
+
         losses *= loss_mask.unsqueeze(-1)
 
         count = torch.max(torch.sum(loss_mask), self.one.to(losses.device))
         loss = torch.sum(losses) / count
+        return loss
+
+@registry.register_loss("m4c_decoding_fl_with_mask")
+class M4CDecodingFLWithMaskLoss(nn.Module):
+    def __init__(self,
+                 alpha=0.25,
+                 gamma=2,
+                 reduction='mean',):
+        super(M4CDecodingFLWithMaskLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+        self.crit = nn.BCEWithLogitsLoss(reduction='none')
+
+    def forward(self, logits, label):
+        '''
+        Usage is same as nn.BCEWithLogits:
+            >>> criteria = FocalLossV1()
+            >>> logits = torch.randn(8, 19, 384, 384)
+            >>> lbs = torch.randint(0, 2, (8, 19, 384, 384)).float()
+            >>> loss = criteria(logits, lbs)
+        '''
+        # probs = torch.sigmoid(logits)
+        scores = model_output["scores"]
+        targets = sample_list["targets"]
+        loss_mask = sample_list["train_loss_mask"]
+
+        coeff = torch.abs(targets - scores).pow(self.gamma).neg()
+        log_probs = torch.where(scores >= 0,
+                F.softplus(scores, -1, 50),
+                scores - F.softplus(scores, 1, 50))
+        log_1_probs = torch.where(scores >= 0,
+                -scores + F.softplus(scores, -1, 50),
+                -F.softplus(scores, 1, 50))
+        loss = targets * self.alpha * log_probs + (1. - targets) * (1. - self.alpha) * log_1_probs
+        loss = loss * coeff
+
+        losses *= loss_mask.unsqueeze(-1)
+        count = torch.max(torch.sum(loss_mask), self.one.to(losses.device))
+        loss = torch.sum(losses) / count
+        
         return loss
