@@ -1,6 +1,6 @@
 dataset_attributes:
   m4c_textcaps:
-      data_root_dir: /m4c/mmf/
+      data_root_dir: /root/mmf/
       image_depth_first: false
       fast_read: false
       features_max_len: 100
